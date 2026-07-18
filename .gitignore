@@ -1,0 +1,20 @@
+.env
+.venv/
+.venv_windows/
+__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite3
+.DS_Store
+.streamlit/secrets.toml
+app_*_backup.py
+app_before_manual_confirmation.py
+app_public_backup.py
+jobhunt_ai_v*/
+jobhunt_ai_mvp/
+jobhunt_ai_mvp 2/
+experiments/
+*.zip

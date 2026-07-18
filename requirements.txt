@@ -1,0 +1,5 @@
+streamlit>=1.40
+google-genai>=1.0.0
+python-dotenv>=1.0.1
+ddgs>=9.14.4
+z3-solver>=4.13.0.0

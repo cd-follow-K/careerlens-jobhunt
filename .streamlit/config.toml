@@ -1,0 +1,16 @@
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#3156D3"
+backgroundColor = "#F7F9FC"
+secondaryBackgroundColor = "#EEF2F8"
+textColor = "#172033"
+font = "Inter, Noto Sans JP, sans-serif"
+baseFontSize = 16
+baseRadius = "large"
+buttonRadius = "large"
+borderColor = "#E3E8F0"
+showWidgetBorder = true
+showSidebarBorder = true
