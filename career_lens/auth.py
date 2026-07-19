@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 import sqlite3
 import unicodedata
@@ -12,6 +13,8 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
+
+import requests
 
 from . import common as _common
 
@@ -25,6 +28,70 @@ _current_scope: ContextVar[tuple[int, str]] = ContextVar(
 )
 
 
+class AuthStorageError(RuntimeError):
+    """Raised when the persistent account store cannot be reached."""
+
+
+def _supabase_config() -> tuple[str, str] | None:
+    url = str(os.getenv("SUPABASE_URL", "")).strip().rstrip("/")
+    key = str(
+        os.getenv("SUPABASE_SECRET_KEY", "")
+        or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    ).strip()
+    if not url and not key:
+        return None
+    if not url or not key:
+        raise AuthStorageError(
+            "SupabaseのURLと秘密鍵の両方を設定してください。"
+        )
+    if not url.startswith("https://"):
+        raise AuthStorageError("SUPABASE_URLが不正です。")
+    return url, key
+
+
+def using_persistent_auth() -> bool:
+    """Return whether accounts are stored in Supabase."""
+    return _supabase_config() is not None
+
+
+def _username_lookup(normalized_username: str) -> str:
+    return hashlib.sha256(normalized_username.encode("utf-8")).hexdigest()
+
+
+def _supabase_request(
+    method: str,
+    *,
+    params: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> requests.Response:
+    config = _supabase_config()
+    if config is None:
+        raise AuthStorageError("Supabaseが設定されていません。")
+    url, key = config
+    headers = {
+        "apikey": key,
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    # New sb_secret keys are not JWTs and must not be used as bearer tokens.
+    if not key.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        response = requests.request(
+            method,
+            f"{url}/rest/v1/careerlens_users",
+            headers=headers,
+            params=params,
+            json=payload,
+            timeout=12,
+        )
+    except requests.RequestException as exc:
+        raise AuthStorageError(
+            "アカウント保存先に接続できません。"
+        ) from exc
+    return response
+
+
 def _connect() -> sqlite3.Connection:
     connection = sqlite3.connect(_common.DB_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
@@ -32,6 +99,8 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_auth_db() -> None:
+    if using_persistent_auth():
+        return
     with _connect() as conn:
         conn.execute(
             """
@@ -72,7 +141,6 @@ def _derive_password(password: str, salt: bytes, iterations: int) -> bytes:
 
 
 def create_account(username: str, display_name: str, password: str) -> dict[str, Any]:
-    init_auth_db()
     normalized = validate_username(username)
     validate_password(password)
     clean_display_name = unicodedata.normalize("NFKC", str(display_name or "")).strip()
@@ -84,6 +152,36 @@ def create_account(username: str, display_name: str, password: str) -> dict[str,
     salt = secrets.token_bytes(24)
     password_hash = _derive_password(password, salt, PASSWORD_ITERATIONS)
     user_id = uuid4().hex
+    created_at = datetime.now().isoformat(timespec="seconds")
+
+    if using_persistent_auth():
+        response = _supabase_request(
+            "POST",
+            payload={
+                "user_id": user_id,
+                "username": normalized,
+                "username_lookup": _username_lookup(normalized),
+                "display_name": clean_display_name,
+                "password_salt": base64.b64encode(salt).decode("ascii"),
+                "password_hash": base64.b64encode(password_hash).decode("ascii"),
+                "password_iterations": PASSWORD_ITERATIONS,
+                "created_at": created_at,
+                "is_active": True,
+            },
+        )
+        if response.status_code == 409:
+            raise ValueError("このメールアドレスは既に使用されています。")
+        if not response.ok:
+            raise AuthStorageError(
+                f"アカウントを保存できません。({response.status_code})"
+            )
+        return {
+            "user_id": user_id,
+            "username": normalized,
+            "display_name": clean_display_name,
+        }
+
+    init_auth_db()
     try:
         with _connect() as conn:
             conn.execute(
@@ -100,7 +198,7 @@ def create_account(username: str, display_name: str, password: str) -> dict[str,
                     base64.b64encode(salt).decode("ascii"),
                     base64.b64encode(password_hash).decode("ascii"),
                     PASSWORD_ITERATIONS,
-                    datetime.now().isoformat(timespec="seconds"),
+                    created_at,
                 ),
             )
     except sqlite3.IntegrityError as exc:
@@ -109,19 +207,38 @@ def create_account(username: str, display_name: str, password: str) -> dict[str,
 
 
 def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
-    init_auth_db()
     normalized = normalize_username(username)
     if not normalized or not password:
         return None
-    with _connect() as conn:
-        row = conn.execute(
-            """
-            SELECT user_id, username, display_name, password_salt,
-                   password_hash, password_iterations, is_active
-            FROM users WHERE username = ?
-            """,
-            (normalized,),
-        ).fetchone()
+    if using_persistent_auth():
+        response = _supabase_request(
+            "GET",
+            params={
+                "username_lookup": f"eq.{_username_lookup(normalized)}",
+                "select": (
+                    "user_id,username,display_name,password_salt,"
+                    "password_hash,password_iterations,is_active"
+                ),
+                "limit": "1",
+            },
+        )
+        if not response.ok:
+            raise AuthStorageError(
+                f"アカウントを読み込めません。({response.status_code})"
+            )
+        rows = response.json()
+        row = rows[0] if rows else None
+    else:
+        init_auth_db()
+        with _connect() as conn:
+            row = conn.execute(
+                """
+                SELECT user_id, username, display_name, password_salt,
+                       password_hash, password_iterations, is_active
+                FROM users WHERE username = ?
+                """,
+                (normalized,),
+            ).fetchone()
     if not row or not bool(row["is_active"]):
         return None
     try:
@@ -140,6 +257,24 @@ def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
 
 
 def get_user_by_id(user_id: str) -> dict[str, Any] | None:
+    if using_persistent_auth():
+        response = _supabase_request(
+            "GET",
+            params={
+                "user_id": f"eq.{str(user_id)}",
+                "is_active": "eq.true",
+                "select": "user_id,username,display_name",
+                "limit": "1",
+            },
+        )
+        if not response.ok:
+            raise AuthStorageError(
+                f"アカウントを読み込めません。({response.status_code})"
+            )
+        rows = response.json()
+        return rows[0] if rows else None
+
+    init_auth_db()
     with _connect() as conn:
         row = conn.execute(
             """

@@ -43,7 +43,11 @@ def require_user_account() -> dict[str, Any]:
     """Require a real account and restore its user context on every rerun."""
     current = st.session_state.get("current_user")
     if isinstance(current, dict) and current.get("user_id"):
-        valid_user = get_user_by_id(str(current["user_id"]))
+        try:
+            valid_user = get_user_by_id(str(current["user_id"]))
+        except AuthStorageError as exc:
+            st.error(str(exc))
+            st.stop()
         if valid_user:
             st.session_state["current_user"] = valid_user
             set_current_user(str(valid_user["user_id"]))
@@ -70,7 +74,11 @@ def require_user_account() -> dict[str, Any]:
                 remaining = max(1, int(locked_until - time.time()))
                 st.error(f"試行回数が多いため、{remaining}秒後に再度お試しください。")
             else:
-                user = authenticate_user(username, password)
+                try:
+                    user = authenticate_user(username, password)
+                except AuthStorageError as exc:
+                    st.error(str(exc))
+                    st.stop()
                 if user:
                     st.session_state["current_user"] = user
                     st.session_state["login_failed_attempts"] = 0
@@ -105,7 +113,7 @@ def require_user_account() -> dict[str, Any]:
             else:
                 try:
                     user = create_account(new_username, display_name, new_password)
-                except ValueError as exc:
+                except (ValueError, AuthStorageError) as exc:
                     st.error(str(exc))
                 else:
                     st.session_state["current_user"] = user
