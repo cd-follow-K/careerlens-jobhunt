@@ -40,9 +40,13 @@ def require_access_password() -> None:
 
 
 def require_user_account() -> dict[str, Any]:
-    """Require a real account and restore its user context on every rerun."""
+    """Restore an account or an isolated, non-persistent guest session."""
     current = st.session_state.get("current_user")
     if isinstance(current, dict) and current.get("user_id"):
+        if current.get("is_guest") and is_guest_user_id(str(current["user_id"])):
+            guest_store = st.session_state.setdefault("guest_session_store", {})
+            set_current_user(str(current["user_id"]), guest_store)
+            return current
         try:
             valid_user = get_user_by_id(str(current["user_id"]))
         except AuthStorageError as exc:
@@ -55,7 +59,24 @@ def require_user_account() -> dict[str, Any]:
         st.session_state.pop("current_user", None)
 
     st.title("CareerLens")
-    st.caption("自分専用の検索履歴と確認状態を利用するにはログインしてください。")
+    st.caption("ログインすると、自分専用の検索履歴と確認状態を保存できます。")
+    if st.button(
+        "ゲストとして利用",
+        type="primary",
+        use_container_width=True,
+        key="guest_login_button",
+    ):
+        guest = create_guest_user()
+        guest_store: dict[str, Any] = {}
+        st.session_state["current_user"] = guest
+        st.session_state["guest_session_store"] = guest_store
+        set_current_user(str(guest["user_id"]), guest_store)
+        st.rerun()
+    st.caption(
+        "ゲスト利用では検索・AI検証・Z3・ICSを試せますが、"
+        "検索履歴や確認状態はブラウザセッション終了後に保持されません。"
+    )
+    st.divider()
     login_tab, register_tab = st.tabs(["ログイン", "アカウント作成"])
 
     with login_tab:
@@ -80,6 +101,7 @@ def require_user_account() -> dict[str, Any]:
                     st.error(str(exc))
                     st.stop()
                 if user:
+                    st.session_state.pop("guest_session_store", None)
                     st.session_state["current_user"] = user
                     st.session_state["login_failed_attempts"] = 0
                     st.session_state.pop("login_locked_until", None)
@@ -116,6 +138,7 @@ def require_user_account() -> dict[str, Any]:
                 except (ValueError, AuthStorageError) as exc:
                     st.error(str(exc))
                 else:
+                    st.session_state.pop("guest_session_store", None)
                     st.session_state["current_user"] = user
                     set_current_user(str(user["user_id"]))
                     st.rerun()
@@ -124,12 +147,19 @@ def require_user_account() -> dict[str, Any]:
 
 
 def render_account_controls(user: dict[str, Any]) -> None:
+    is_guest = bool(user.get("is_guest"))
     with st.sidebar:
-        st.caption(f"ログイン中：{user.get('display_name') or user.get('username')}")
-        if st.button("ログアウト", use_container_width=True):
+        if is_guest:
+            st.caption("ゲストとして利用中")
+            st.info("履歴・確認状態・日程履歴は永続保存されません。")
+        else:
+            st.caption(f"ログイン中：{user.get('display_name') or user.get('username')}")
+        button_label = "ゲスト利用を終了" if is_guest else "ログアウト"
+        if st.button(button_label, use_container_width=True):
             for key in (
                 "current_user", "latest_analysis", "latest_schedule",
                 "latest_search_performance", "deadline_confirmation_feedback",
+                "guest_session_store",
             ):
                 st.session_state.pop(key, None)
             set_current_user("legacy-local-user")
@@ -1474,6 +1504,12 @@ def main() -> None:
     require_access_password()
     current_user = require_user_account()
     render_account_controls(current_user)
+
+    if current_user.get("is_guest"):
+        st.info(
+            "ゲスト利用中です。主要機能は利用できますが、検索履歴、確認状態、"
+            "公式ドメイン判定、Z3日程履歴はセッション終了後に保持されません。"
+        )
 
     st.markdown(
         """

@@ -20,8 +20,12 @@ from . import common as _common
 
 
 PASSWORD_ITERATIONS = 600_000
+GUEST_USER_PREFIX = "guest-session:"
 _current_user_id: ContextVar[str] = ContextVar(
     "careerlens_current_user_id", default="legacy-local-user"
+)
+_current_guest_store: ContextVar[dict[str, Any] | None] = ContextVar(
+    "careerlens_current_guest_store", default=None
 )
 _current_scope: ContextVar[tuple[int, str]] = ContextVar(
     "careerlens_current_scope", default=(0, "")
@@ -286,12 +290,50 @@ def get_user_by_id(user_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def set_current_user(user_id: str) -> None:
-    _current_user_id.set(str(user_id or "legacy-local-user"))
+def create_guest_user() -> dict[str, Any]:
+    """Create an isolated identity that exists only in one browser session."""
+    return {
+        "user_id": f"{GUEST_USER_PREFIX}{uuid4().hex}",
+        "username": "",
+        "display_name": "ゲスト",
+        "is_guest": True,
+    }
+
+
+def is_guest_user_id(user_id: str | None = None) -> bool:
+    candidate = str(user_id if user_id is not None else _current_user_id.get())
+    return candidate.startswith(GUEST_USER_PREFIX)
+
+
+def set_current_user(
+    user_id: str,
+    guest_store: dict[str, Any] | None = None,
+) -> None:
+    normalized = str(user_id or "legacy-local-user")
+    previous = _current_user_id.get()
+    _current_user_id.set(normalized)
+    if is_guest_user_id(normalized):
+        if guest_store is not None:
+            _current_guest_store.set(guest_store)
+        elif previous != normalized:
+            _current_guest_store.set({})
+    else:
+        _current_guest_store.set(None)
 
 
 def get_current_user_id() -> str:
     return _current_user_id.get()
+
+
+def get_guest_session_store() -> dict[str, Any]:
+    """Return non-persistent state isolated to the current guest session."""
+    if not is_guest_user_id():
+        return {}
+    store = _current_guest_store.get()
+    if store is None:
+        store = {}
+        _current_guest_store.set(store)
+    return store
 
 
 def set_research_scope(target_year: int, recruitment_type: str) -> None:

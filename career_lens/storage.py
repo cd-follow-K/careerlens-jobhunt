@@ -1,8 +1,15 @@
 """SQLite persistence for histories, confirmations, caches, and deadline registry."""
 
+import copy
+
 from .common import *
 from . import common as _common
-from .auth import get_current_user_id, get_research_scope
+from .auth import (
+    get_current_user_id,
+    get_guest_session_store,
+    get_research_scope,
+    is_guest_user_id,
+)
 
 
 def _db_path() -> Path:
@@ -19,6 +26,16 @@ def _personal_scope(
         int(target_year if target_year is not None else scope_year),
         str(recruitment_type if recruitment_type is not None else scope_type),
     )
+
+
+def _guest_section(name: str) -> dict[Any, Any]:
+    """Return an in-memory guest namespace that is never written to SQLite."""
+    store = get_guest_session_store()
+    section = store.setdefault(name, {})
+    if not isinstance(section, dict):
+        section = {}
+        store[name] = section
+    return section
 
 
 def init_db() -> None:
@@ -251,6 +268,12 @@ def get_deadline_confirmation(
     recruitment_type: str | None = None,
 ) -> str:
     user_id, scope_year, scope_type = _personal_scope(target_year, recruitment_type)
+    if is_guest_user_id(user_id):
+        key = (
+            registry_company_key(company_name), scope_year, scope_type,
+            registry_course_key(course_name), deadline, source_url,
+        )
+        return str(_guest_section("deadline_confirmations").get(key, "未確認"))
     try:
         with sqlite3.connect(_db_path()) as conn:
             row = conn.execute(
@@ -282,6 +305,13 @@ def set_deadline_confirmation(
     if status not in {"未確認", "確認済み", "誤情報として除外"}:
         raise ValueError("不正な確認状態です。")
     user_id, scope_year, scope_type = _personal_scope(target_year, recruitment_type)
+    if is_guest_user_id(user_id):
+        key = (
+            registry_company_key(company_name), scope_year, scope_type,
+            registry_course_key(course_name), deadline, source_url,
+        )
+        _guest_section("deadline_confirmations")[key] = status
+        return
     with sqlite3.connect(_db_path()) as conn:
         conn.execute(
             """
@@ -387,6 +417,9 @@ def get_official_domain_confirmation(company_name: str, url: str) -> str:
     domain = host_of(url)
     if not domain:
         return "未確認"
+    if is_guest_user_id():
+        key = (registry_company_key(company_name), domain)
+        return str(_guest_section("official_domain_confirmations").get(key, "未確認"))
     try:
         with sqlite3.connect(_db_path()) as conn:
             row = conn.execute(
@@ -410,6 +443,10 @@ def set_official_domain_confirmation(
     domain = host_of(url)
     if not domain:
         raise ValueError("URLからドメインを確認できません。")
+    if is_guest_user_id():
+        key = (registry_company_key(company_name), domain)
+        _guest_section("official_domain_confirmations")[key] = status
+        return
     with sqlite3.connect(_db_path()) as conn:
         conn.execute(
             """
@@ -519,10 +556,12 @@ def save_deadlines_to_registry(
     verification: VerificationResult,
 ) -> None:
     """企業を最上位単位とし、年度・募集区分を分離して締切を蓄積する。"""
+    user_id = get_current_user_id()
+    if is_guest_user_id(user_id):
+        return
     company_key = registry_company_key(company_name)
     now = datetime.now().isoformat(timespec="seconds")
     rows = _registry_current_rows(company_name, ai_result, verification)
-    user_id = get_current_user_id()
     with sqlite3.connect(_db_path()) as conn:
         conn.execute(
             """
@@ -572,6 +611,8 @@ def load_deadline_registry(
 ) -> list[dict[str, Any]]:
     company_key = registry_company_key(company_name)
     user_id = get_current_user_id()
+    if is_guest_user_id(user_id):
+        return []
     with sqlite3.connect(_db_path()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -678,6 +719,8 @@ def save_history(
     ai_result: dict[str, Any],
     verification: VerificationResult,
 ) -> None:
+    if is_guest_user_id():
+        return
     with sqlite3.connect(_db_path()) as conn:
         conn.execute(
             """
@@ -724,6 +767,14 @@ def load_search_cache(
     company: str, target_year: int, recruitment_type: str, strategy: str
 ) -> list[dict[str, Any]] | None:
     key = _search_cache_key(company, target_year, recruitment_type, strategy)
+    if is_guest_user_id():
+        cached = _guest_section("search_cache").get(key)
+        if not isinstance(cached, dict) or not _cache_is_fresh(
+            str(cached.get("created_at") or ""), SEARCH_CACHE_TTL_HOURS
+        ):
+            return None
+        results = cached.get("results")
+        return copy.deepcopy(results) if isinstance(results, list) else None
     with sqlite3.connect(_db_path()) as conn:
         row = conn.execute(
             "SELECT created_at, results_json FROM web_search_cache WHERE cache_key = ?",
@@ -746,6 +797,12 @@ def save_search_cache(
     results: list[dict[str, Any]],
 ) -> None:
     key = _search_cache_key(company, target_year, recruitment_type, strategy)
+    if is_guest_user_id():
+        _guest_section("search_cache")[key] = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "results": copy.deepcopy(results),
+        }
+        return
     with sqlite3.connect(_db_path()) as conn:
         conn.execute(
             """
@@ -827,6 +884,8 @@ def load_source_extraction_cache(
     record: dict[str, Any],
     user_id: str | None = None,
 ) -> dict[str, Any] | None:
+    if is_guest_user_id(user_id):
+        return None
     key = _source_extraction_cache_key(
         company, target_year, recruitment_type, record, user_id
     )
@@ -848,6 +907,8 @@ def save_source_extraction_cache(
     company: str, target_year: int, recruitment_type: str,
     record: dict[str, Any], result: dict[str, Any], user_id: str | None = None
 ) -> None:
+    if is_guest_user_id(user_id):
+        return
     key = _source_extraction_cache_key(
         company, target_year, recruitment_type, record, user_id
     )
@@ -875,6 +936,8 @@ def save_schedule_history(
     plan: list[dict[str, Any]],
     solver_status: str,
 ) -> None:
+    if is_guest_user_id():
+        return
     with sqlite3.connect(_db_path()) as conn:
         conn.execute(
             """
